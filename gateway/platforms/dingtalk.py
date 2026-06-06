@@ -940,19 +940,19 @@ class DingTalkAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
     ) -> SendResult:
-        """Send a message proactively via the DingTalk OToMessage batchSend API.
+        """Send a message proactively via DingTalk robot APIs.
 
         Used when session_webhook is unavailable (e.g. cron push notifications,
         cross-platform send_message calls) to send messages without requiring the
         user to have sent an inbound message first.
 
-        Uses the new ``v1.0/robot/oToMessages/batchSend`` REST API which accepts
-        ``userIds`` (DingTalk staffId / userId) to target specific users, rather
-        than ``open_conversation_id`` which requires an existing session.
-
-        The old ``PrivateChatSendRequest`` SDK method (robot_1_0) returns
+        For DMs: uses ``v1.0/robot/oToMessages/batchSend`` REST API with userIds
+        (staffId). The old PrivateChatSendRequest SDK method (robot_1_0) returns
         ``resource.not.found`` for proactive sends because it requires a prior
         conversation context — the batchSend API does not.
+
+        For groups: uses ``v1.0/robot/orgGroupSend`` REST API with
+        open_conversation_id. No userId/staffId needed for groups.
 
         Requires:
         - ``_http_client`` initialized (always available after connect())
@@ -960,8 +960,12 @@ class DingTalkAdapter(BasePlatformAdapter):
           client_id/secret already configured for Stream mode)
         - Robot application must have "机器人主动发消息" permission enabled
           in DingTalk Open Platform (open.dingtalk.com → 应用能力 → 机器人)
-        - ``userId`` (staffId) available — extracted from inbound message context
-          or from ``channel_directory.json`` (requires ``user_id`` field)
+        - DM: userId (staffId) available — from inbound message context or
+          ``channel_directory.json`` (requires ``user_id`` field)
+        - Group: chat_id must be a valid open_conversation_id for the target
+          group; ``channel_directory.json`` must have ``type: "group"`` for
+          the entry (otherwise the DM batchSend path is used and will fail
+          without a ``user_id``)
         """
         if not self._http_client:
             return SendResult(
@@ -969,92 +973,117 @@ class DingTalkAdapter(BasePlatformAdapter):
                 error="HTTP client not initialized for proactive send.",
             )
 
-        # Normalize markdown content for DingTalk
-        normalized = self._normalize_markdown(content[: self.MAX_MESSAGE_LENGTH])
-
         try:
             access_token = await self._get_access_token()
             if not access_token:
                 return SendResult(success=False, error="Could not obtain DingTalk access token")
 
-            # Resolve userId (staffId) for the target chat_id.
-            # The batchSend API requires userIds in staffId format, not
-            # open_conversation_id (cid...) format.
+            # Normalize markdown content for DingTalk
+            normalized = self._normalize_markdown(content[: self.MAX_MESSAGE_LENGTH])
+
+            # Determine conversation type (group vs DM) and resolve userId/staffId.
+            # Priority for is_group detection:
+            #   1. _message_contexts (conversation_type from inbound message)
+            #   2. channel_directory.json type field ("group" vs "dm")
+            #   3. Default to DM (safe fallback — proactive sends are usually DMs)
+            is_group = False
             user_id = ""
             current_message = self._message_contexts.get(chat_id)
+
             if current_message:
+                conv_type = getattr(current_message, "conversation_type", "1") or "1"
+                is_group = conv_type == "2"
                 user_id = (
                     getattr(current_message, "sender_staff_id", "") or
                     getattr(current_message, "sender_id", "") or ""
                 )
-            # If no stored context, try channel_directory for staffId mapping
-            if not user_id:
+
+            # Fallback: check channel_directory for both type and user_id
+            dir_entry = None
+            if not current_message:
                 try:
                     from gateway.channel_directory import load_directory
                     directory = load_directory()
                     dingtalk_channels = directory.get("platforms", {}).get("dingtalk", [])
                     for ch in dingtalk_channels:
-                        if ch.get("id") == chat_id and ch.get("user_id"):
-                            user_id = ch["user_id"]
+                        if ch.get("id") == chat_id:
+                            dir_entry = ch
                             break
                 except Exception:
                     pass
 
-            if not user_id:
-                return SendResult(
-                    success=False,
-                    error="No userId/staffId available for proactive send. "
-                          "Add a 'user_id' field to the DingTalk entry in "
-                          "~/.hermes/channel_directory.json, or ensure the user "
-                          "has sent a message to the bot so sender_staff_id can "
-                          "be cached.",
-                )
-
-            # Determine conversation type (group vs DM) for the API endpoint.
-            # batchSend is for DMs; org_group_send SDK method is for groups.
-            is_group = False
-            if current_message:
-                conv_type = getattr(current_message, "conversation_type", "1") or "1"
-                is_group = conv_type == "2"
+            if dir_entry:
+                # Use type field from channel_directory to determine group vs DM
+                chat_type = (dir_entry.get("type") or "").lower()
+                if chat_type == "group":
+                    is_group = True
+                # Also resolve userId from directory entry (for DMs)
+                if not user_id and dir_entry.get("user_id"):
+                    user_id = dir_entry["user_id"]
 
             msg_param = json.dumps({
                 "title": "Hermes",
                 "text": normalized,
             })
 
-            if is_group and self._robot_sdk and dingtalk_robot_client:
-                # Group send uses the existing SDK method (org_group_send)
-                # which accepts open_conversation_id directly.
-                request = dingtalk_robot_models.OrgGroupSendRequest(
-                    open_conversation_id=chat_id,
-                    robot_code=self._robot_code,
-                    msg_key="sampleMarkdown",
-                    msg_param=msg_param,
-                    token=access_token,
-                )
-                response = await self._robot_sdk.org_group_send_with_options_async(
-                    request,
-                    dingtalk_robot_models.OrgGroupSendHeaders(),
-                    runtime=tea_util_models.RuntimeOptions(),
-                )
-                body = response.body if response and response.body else None
-                if body and getattr(body, "success", False):
-                    msg_id = getattr(body, "process_query_key", None) or uuid.uuid4().hex[:12]
-                    logger.info(
-                        "[%s] Proactive group send succeeded for chat_id=%s",
-                        self.name, chat_id,
-                    )
-                    return SendResult(success=True, message_id=msg_id)
-                err_msg = "unknown error"
-                if body:
-                    err_msg = getattr(body, "message", None) or str(body)
-                return SendResult(success=False, error=f"Proactive group send failed: {err_msg}")
+            if is_group:
+                # ---- Group proactive send via orgGroupSend REST API ----
+                # POST https://api.dingtalk.com/v1.0/robot/orgGroupSend
+                # Uses open_conversation_id directly — no userId/staffId needed.
+                # This REST API is more reliable than the SDK wrapper
+                # (OrgGroupSendRequest) and works without the alibabacloud
+                # DingTalk SDK being installed.
+                group_url = "https://api.dingtalk.com/v1.0/robot/orgGroupSend"
+                group_headers = {
+                    "x-acs-dingtalk-access-token": access_token,
+                    "Content-Type": "application/json",
+                }
+                group_payload = {
+                    "open_conversation_id": chat_id,
+                    "robot_code": self._robot_code,
+                    "msg_key": "sampleMarkdown",
+                    "msg_param": msg_param,
+                }
 
-            # DM send uses the new batchSend REST API.
+                group_resp = await self._http_client.post(
+                    group_url, json=group_payload, headers=group_headers, timeout=15.0,
+                )
+                if group_resp.status_code >= 300:
+                    body_text = group_resp.text[:500]
+                    logger.warning(
+                        "[%s] Proactive orgGroupSend HTTP %d for chat_id=%s: %s",
+                        self.name, group_resp.status_code, chat_id, body_text,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"Proactive orgGroupSend HTTP {group_resp.status_code}: {body_text}",
+                    )
+
+                group_data = group_resp.json()
+                process_key = group_data.get("processQueryKey", "")
+                logger.info(
+                    "[%s] Proactive orgGroupSend succeeded for chat_id=%s",
+                    self.name, chat_id,
+                )
+                return SendResult(success=True, message_id=process_key or uuid.uuid4().hex[:12])
+
+            # ---- DM proactive send via batchSend REST API ----
             # The SDK's PrivateChatSendRequest (robot_1_0) returns resource.not.found
             # for proactive sends — it requires an existing conversation context.
             # The batchSend API (/v1.0/robot/oToMessages/batchSend) uses userIds
             # (staffId) directly and does not require prior interaction.
+            if not user_id:
+                return SendResult(
+                    success=False,
+                    error="No userId/staffId available for proactive DM send. "
+                          "Add a 'user_id' field to the DingTalk entry in "
+                          "~/.hermes/channel_directory.json, or ensure the user "
+                          "has sent a message to the bot so sender_staff_id can "
+                          "be cached. If this chat_id is a group, add "
+                          "'type: \"group\"' to the channel_directory entry so "
+                          "the orgGroupSend API is used instead.",
+                )
+
             batch_url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
             batch_headers = {
                 "x-acs-dingtalk-access-token": access_token,
